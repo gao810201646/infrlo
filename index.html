@@ -1,0 +1,541 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D 粒子爱心</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        body {
+            background: radial-gradient(ellipse at center, #1a0a0a 0%, #050505 100%);
+            overflow: hidden;
+            font-family: 'PingFang SC', 'Microsoft YaHei', 'Helvetica Neue', sans-serif;
+            user-select: none;
+            -webkit-user-select: none;
+            -webkit-tap-highlight-color: transparent;
+            height: 100vh;
+            width: 100vw;
+        }
+
+        canvas { display: block; }
+
+        .hint {
+            position: fixed;
+            bottom: 50px;
+            left: 50%;
+            transform: translateX(-50%);
+            color: rgba(255, 255, 255, 0.4);
+            font-size: 14px;
+            letter-spacing: 2px;
+            text-align: center;
+            z-index: 10;
+            pointer-events: none;
+            transition: all 0.5s ease;
+        }
+
+        .hint.scattered-hint {
+            color: rgba(255, 150, 170, 0.7);
+            font-size: 16px;
+            letter-spacing: 3px;
+            animation: hintPulse 2s ease-in-out infinite;
+        }
+
+        @keyframes hintPulse {
+            0%, 100% { opacity: 0.7; }
+            50% { opacity: 1; }
+        }
+
+        @media (max-width: 600px) {
+            .hint { font-size: 12px; letter-spacing: 1px; bottom: 40px; }
+            .hint.scattered-hint { font-size: 14px; }
+        }
+    </style>
+</head>
+<body>
+    <p class="hint" id="hint">点击爱心散开</p>
+
+    <script src="https://cdn.jsdelivr.net/npm/three@0.157.0/build/three.min.js">
+    </script>
+
+    <script>
+        (function() {
+            // ==================== DOM ====================
+            const hintEl = document.getElementById('hint');
+
+            // ==================== CONSTANTS ====================
+            const PARTICLE_COUNT = 6500;
+            const HEART_SCALE = 3.8;
+            const SCATTER_RADIUS_MIN = 7;
+            const SCATTER_RADIUS_MAX = 18;
+            const ANIMATION_SPEED = 1.6;
+            const ROTATE_SMOOTH = 6;
+
+            // ==================== STATE ====================
+            let isAssembled = true;
+            let animationProgress = 1.0; // 0=scattered, 1=assembled
+            let animationTarget = 1.0;
+            let isDragging = false;
+            let dragStartX = 0;
+            let dragStartY = 0;
+            let hasMoved = false;
+            let rotationVelocityY = 0;
+            let targetRotationY = 0;
+            let currentRotationY = 0;
+
+            // ==================== THREE.JS SETUP ====================
+            const scene = new THREE.Scene();
+
+            const camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.5, 100);
+            camera.position.set(0, 0.5, 16);
+            camera.lookAt(0, 0, 0);
+
+            const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+            renderer.setClearColor(0x000000, 1);
+            document.body.appendChild(renderer.domElement);
+
+            // ==================== GLOW TEXTURE ====================
+            function createGlowTexture(innerColor, outerColor, size) {
+                const canvas = document.createElement('canvas');
+                canvas.width = size;
+                canvas.height = size;
+                const ctx = canvas.getContext('2d');
+                const half = size / 2;
+                const gradient = ctx.createRadialGradient(half, half, 0, half, half, half);
+                gradient.addColorStop(0, innerColor);
+                gradient.addColorStop(0.08, innerColor);
+                gradient.addColorStop(0.3, outerColor);
+                gradient.addColorStop(0.6, 'rgba(255,20,60,0.03)');
+                gradient.addColorStop(1, 'rgba(0,0,0,0)');
+                ctx.fillStyle = gradient;
+                ctx.fillRect(0, 0, size, size);
+                const tex = new THREE.CanvasTexture(canvas);
+                tex.needsUpdate = true;
+                return tex;
+            }
+
+            function createStarTexture(size) {
+                const canvas = document.createElement('canvas');
+                canvas.width = size;
+                canvas.height = size;
+                const ctx = canvas.getContext('2d');
+                const half = size / 2;
+                const gradient = ctx.createRadialGradient(half, half, 0, half, half, half);
+                gradient.addColorStop(0, 'rgba(255,255,255,1)');
+                gradient.addColorStop(0.15, 'rgba(255,255,255,0.7)');
+                gradient.addColorStop(0.5, 'rgba(255,200,220,0.08)');
+                gradient.addColorStop(1, 'rgba(0,0,0,0)');
+                ctx.fillStyle = gradient;
+                ctx.fillRect(0, 0, size, size);
+                const tex = new THREE.CanvasTexture(canvas);
+                tex.needsUpdate = true;
+                return tex;
+            }
+
+            const glowTex = createGlowTexture('rgba(255,255,255,1)', 'rgba(255,30,70,0.7)', 128);
+            const starTex = createStarTexture(32);
+
+            // ==================== HEART POINT GENERATION ====================
+            function isInsideHeart(x, y, z) {
+                const x2 = x * x;
+                const y2 = y * y;
+                const z2 = z * z;
+                const z3 = z2 * z;
+                const term1 = x2 + 2.25 * y2 + z2 - 1.0;
+                const val = term1 * term1 * term1 - x2 * z3 - 0.1125 * y2 * z3;
+                return val <= 0;
+            }
+
+            function generateHeartPoints(count) {
+                const positions = new Float32Array(count * 3);
+                const colors = new Float32Array(count * 3);
+                const sizes = new Float32Array(count);
+                const bounds = { xMin: -1.35, xMax: 1.35, yMin: -1.55, yMax: 1.25, zMin: -1.35, zMax: 1.35 };
+                const maxAttempts = count * 40;
+                let found = 0, attempts = 0;
+                let minY = Infinity, maxY = -Infinity;
+                const tempPoints = [];
+
+                while (found < count && attempts < maxAttempts) {
+                    const rx = bounds.xMin + Math.random() * (bounds.xMax - bounds.xMin);
+                    const ry = bounds.yMin + Math.random() * (bounds.yMax - bounds.yMin);
+                    const rz = bounds.zMin + Math.random() * (bounds.zMax - bounds.zMin);
+                    if (isInsideHeart(rx, ry, rz)) {
+                        tempPoints.push({ x: rx * HEART_SCALE, y: ry * HEART_SCALE, z: rz * HEART_SCALE, ry: ry });
+                        if (ry < minY) minY = ry;
+                        if (ry > maxY) maxY = ry;
+                        found++;
+                    }
+                    attempts++;
+                }
+
+                const colorStops = [
+                    { pos: 0.0, r: 0.78, g: 0.05, b: 0.08 },
+                    { pos: 0.25, r: 0.92, g: 0.08, b: 0.15 },
+                    { pos: 0.5, r: 1.0, g: 0.12, b: 0.25 },
+                    { pos: 0.75, r: 1.0, g: 0.22, b: 0.4 },
+                    { pos: 1.0, r: 1.0, g: 0.35, b: 0.55 },
+                ];
+
+                function sampleGradient(t) {
+                    t = Math.max(0, Math.min(1, t));
+                    let lower = colorStops[0], upper = colorStops[colorStops.length - 1];
+                    for (let i = 0; i < colorStops.length - 1; i++) {
+                        if (t >= colorStops[i].pos && t <= colorStops[i + 1].pos) { lower = colorStops[i]; upper = colorStops[i + 1]; break; }
+                    }
+                    const range = upper.pos - lower.pos;
+                    const frac = range > 0 ? (t - lower.pos) / range : 0;
+                    return {
+                        r: lower.r + (upper.r - lower.r) * frac,
+                        g: lower.g + (upper.g - lower.g) * frac,
+                        b: lower.b + (upper.b - lower.b) * frac,
+                    };
+                }
+
+                const rangeY = maxY - minY || 1;
+                for (let i = 0; i < tempPoints.length; i++) {
+                    const p = tempPoints[i];
+                    const t = (p.ry - minY) / rangeY;
+                    const col = sampleGradient(t);
+                    const jitter = 0.04;
+                    positions[i * 3] = p.x;
+                    positions[i * 3 + 1] = p.y;
+                    positions[i * 3 + 2] = p.z;
+                    colors[i * 3] = Math.min(1, col.r + (Math.random() - 0.5) * jitter);
+                    colors[i * 3 + 1] = Math.min(1, col.g + (Math.random() - 0.5) * jitter);
+                    colors[i * 3 + 2] = Math.min(1, col.b + (Math.random() - 0.5) * jitter);
+                    sizes[i] = 0.12 + Math.random() * 0.16;
+                }
+                return { positions, colors, sizes, count: tempPoints.length };
+            }
+
+            // ==================== SCATTER POSITIONS ====================
+            function generateScatterPositions(count) {
+                const positions = new Float32Array(count * 3);
+                for (let i = 0; i < count; i++) {
+                    const goldenRatio = (1 + Math.sqrt(5)) / 2;
+                    const idx = i + 1;
+                    const theta = 2 * Math.PI * idx / goldenRatio;
+                    const phi = Math.acos(1 - 2 * (idx - 0.5) / count);
+                    const r = SCATTER_RADIUS_MIN + Math.random() * (SCATTER_RADIUS_MAX - SCATTER_RADIUS_MIN);
+                    positions[i * 3] = r * Math.sin(phi) * Math.cos(theta);
+                    positions[i * 3 + 1] = r * Math.sin(phi) * Math.sin(theta);
+                    positions[i * 3 + 2] = r * Math.cos(phi);
+                }
+                return positions;
+            }
+
+            // ==================== EASING ====================
+            function easeInOutCubic(t) {
+                return t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+            }
+
+            // ==================== CREATE PARTICLE SYSTEM ====================
+            const heartGroup = new THREE.Group();
+            scene.add(heartGroup);
+
+            const { positions: heartPositions, colors: heartColors, sizes: heartSizes, count: actualCount } =
+                generateHeartPoints(PARTICLE_COUNT);
+            const scatterPositions = generateScatterPositions(actualCount);
+            const currentPositions = new Float32Array(heartPositions);
+
+            const heartGeometry = new THREE.BufferGeometry();
+            heartGeometry.setAttribute('position', new THREE.BufferAttribute(currentPositions, 3));
+            heartGeometry.setAttribute('color', new THREE.BufferAttribute(heartColors, 3));
+
+            const heartMaterial = new THREE.PointsMaterial({
+                size: 0.28,
+                map: glowTex,
+                vertexColors: true,
+                blending: THREE.AdditiveBlending,
+                depthWrite: false,
+                depthTest: true,
+                transparent: true,
+                opacity: 0.9,
+            });
+
+            const heartParticles = new THREE.Points(heartGeometry, heartMaterial);
+            heartGroup.add(heartParticles);
+
+            // ==================== TWINKLE DATA ====================
+            // Per-particle twinkle phases & speeds for star-like shimmer
+            const twinklePhases = new Float32Array(actualCount);
+            const twinkleSpeeds = new Float32Array(actualCount);
+            // Flash intensity for scattered state random sparkle
+            const flashIntensity = new Float32Array(actualCount);
+            for (let i = 0; i < actualCount; i++) {
+                twinklePhases[i] = Math.random() * Math.PI * 2;
+                twinkleSpeeds[i] = 2.0 + Math.random() * 6.0; // varied speeds
+                flashIntensity[i] = 0;
+            }
+
+            // ==================== OUTER GLOW LAYER ====================
+            const outerGlowGeo = new THREE.BufferGeometry();
+            const outerGlowPositions = new Float32Array(heartPositions);
+            const outerGlowColors = new Float32Array(heartColors.length);
+            for (let i = 0; i < heartColors.length; i++) {
+                outerGlowColors[i] = heartColors[i] * 0.6;
+            }
+            outerGlowGeo.setAttribute('position', new THREE.BufferAttribute(outerGlowPositions, 3));
+            outerGlowGeo.setAttribute('color', new THREE.BufferAttribute(outerGlowColors, 3));
+
+            // Store reference to original colors for twinkle modulation
+            const baseHeartColors = new Float32Array(heartColors);
+            const baseOuterColors = new Float32Array(outerGlowColors);
+
+            const outerGlowMat = new THREE.PointsMaterial({
+                size: 0.55,
+                map: glowTex,
+                vertexColors: true,
+                blending: THREE.AdditiveBlending,
+                depthWrite: false,
+                depthTest: true,
+                transparent: true,
+                opacity: 0.35,
+            });
+
+            const outerGlow = new THREE.Points(outerGlowGeo, outerGlowMat);
+            heartGroup.add(outerGlow);
+
+            // ==================== BACKGROUND STARS ====================
+            const starCount = 800;
+            const starGeometry = new THREE.BufferGeometry();
+            const starPositionsArr = new Float32Array(starCount * 3);
+            const starColorsArr = new Float32Array(starCount * 3);
+
+            for (let i = 0; i < starCount; i++) {
+                const r = 20 + Math.random() * 40;
+                const theta = Math.random() * Math.PI * 2;
+                const phi = Math.acos(2 * Math.random() - 1);
+                starPositionsArr[i * 3] = r * Math.sin(phi) * Math.cos(theta);
+                starPositionsArr[i * 3 + 1] = r * Math.sin(phi) * Math.sin(theta);
+                starPositionsArr[i * 3 + 2] = r * Math.cos(phi);
+                const brightness = 0.2 + Math.random() * 0.5;
+                const tint = Math.random();
+                if (tint < 0.3) {
+                    starColorsArr[i * 3] = brightness; starColorsArr[i * 3 + 1] = brightness * 0.8; starColorsArr[i * 3 + 2] = brightness * 0.6;
+                } else if (tint < 0.5) {
+                    starColorsArr[i * 3] = brightness * 0.7; starColorsArr[i * 3 + 1] = brightness * 0.7; starColorsArr[i * 3 + 2] = brightness;
+                } else {
+                    starColorsArr[i * 3] = brightness; starColorsArr[i * 3 + 1] = brightness; starColorsArr[i * 3 + 2] = brightness;
+                }
+            }
+
+            starGeometry.setAttribute('position', new THREE.BufferAttribute(starPositionsArr, 3));
+            starGeometry.setAttribute('color', new THREE.BufferAttribute(starColorsArr, 3));
+
+            const starMaterial = new THREE.PointsMaterial({
+                size: 0.15,
+                map: starTex,
+                vertexColors: true,
+                blending: THREE.AdditiveBlending,
+                depthWrite: false,
+                depthTest: false,
+                transparent: true,
+                opacity: 0.7,
+            });
+
+            const stars = new THREE.Points(starGeometry, starMaterial);
+            scene.add(stars);
+
+            // ==================== CLICK DETECTION ON HEART ====================
+            const raycaster = new THREE.Raycaster();
+            raycaster.params.Points.threshold = 1.5;
+
+            function isClickOnHeart(clientX, clientY) {
+                const mouse = new THREE.Vector2();
+                mouse.x = (clientX / window.innerWidth) * 2 - 1;
+                mouse.y = -(clientY / window.innerHeight) * 2 + 1;
+                raycaster.setFromCamera(mouse, camera);
+                const intersects = raycaster.intersectObject(heartParticles);
+                return intersects.length > 0;
+            }
+
+            // ==================== EVENT HANDLERS ====================
+            function getClientX(e) {
+                if (e.touches && e.touches.length > 0) return e.touches[0].clientX;
+                return e.clientX;
+            }
+            function getClientY(e) {
+                if (e.touches && e.touches.length > 0) return e.touches[0].clientY;
+                return e.clientY;
+            }
+
+            function onPointerDown(e) {
+                if (!isAssembled || animationProgress < 0.99) {
+                    animationTarget = 1.0;
+                    return;
+                }
+
+                const cx = getClientX(e);
+                const cy = getClientY(e);
+
+                if (!isClickOnHeart(cx, cy)) return;
+
+                isDragging = true;
+                hasMoved = false;
+                dragStartX = cx;
+                dragStartY = cy;
+                rotationVelocityY = 0;
+            }
+
+            function onPointerMove(e) {
+                if (!isDragging) return;
+                const cx = getClientX(e);
+                const dx = cx - dragStartX;
+                const dy = (getClientY(e) || 0) - dragStartY;
+
+                if (Math.abs(dx) > 3 || Math.abs(dy) > 3) {
+                    hasMoved = true;
+                }
+
+                if (hasMoved) {
+                    targetRotationY += dx * 0.005;
+                    rotationVelocityY = dx * 0.005;
+                    dragStartX = cx;
+                    dragStartY = getClientY(e) || 0;
+                }
+            }
+
+            function onPointerUp() {
+                if (!isDragging) return;
+
+                if (!hasMoved) {
+                    // Pure click, no drag → scatter
+                    animationTarget = 0.0;
+                }
+                // else: drag → inertia rotation continues
+
+                isDragging = false;
+                hasMoved = false;
+            }
+
+            function onResize() {
+                camera.aspect = window.innerWidth / window.innerHeight;
+                camera.updateProjectionMatrix();
+                renderer.setSize(window.innerWidth, window.innerHeight);
+            }
+
+            window.addEventListener('mousedown', onPointerDown);
+            window.addEventListener('mousemove', onPointerMove);
+            window.addEventListener('mouseup', onPointerUp);
+            window.addEventListener('mouseleave', onPointerUp);
+
+            window.addEventListener('touchstart', function(e) {
+                if (e.touches.length === 1) onPointerDown(e);
+            }, { passive: false });
+            window.addEventListener('touchmove', function(e) {
+                if (e.touches.length === 1) onPointerMove(e);
+            }, { passive: false });
+            window.addEventListener('touchend', onPointerUp);
+            window.addEventListener('resize', onResize);
+
+            // ==================== ANIMATION LOOP ====================
+            const clock = new THREE.Clock();
+            let elapsedTotal = 0;
+
+            function animate() {
+                requestAnimationFrame(animate);
+
+                const dt = Math.min(clock.getDelta(), 0.1);
+                elapsedTotal += dt;
+
+                // --- Star twinkling: per-particle color modulation ---
+                if (animationProgress > 0.99 || animationProgress < 0.01) {
+                    const heartColorArr = heartGeometry.attributes.color.array;
+                    const outerColorArr = outerGlowGeo.attributes.color.array;
+                    // Update ~every 3 frames to save perf, looks continuous
+                    const frameSkip = 3;
+                    if (Math.floor(elapsedTotal * 60) % frameSkip === 0) {
+
+                        // --- Scattered: random particle flash ---
+                        if (!isAssembled) {
+                            const flashCount = Math.floor(actualCount * 0.04); // 4% flash each cycle
+                            for (let f = 0; f < flashCount; f++) {
+                                const idx = Math.floor(Math.random() * actualCount);
+                                flashIntensity[idx] = 1.0;
+                            }
+                        }
+
+                        for (let i = 0; i < actualCount; i++) {
+                            // Decay flash intensity
+                            if (flashIntensity[i] > 0.001) {
+                                flashIntensity[i] *= 0.88;
+                            } else {
+                                flashIntensity[i] = 0;
+                            }
+
+                            const twinkle = 0.5 + 0.5 * Math.sin(elapsedTotal * twinkleSpeeds[i] + twinklePhases[i]);
+                            const factor = 0.35 + twinkle * 0.65 + flashIntensity[i] * 2.5;
+                            const i3 = i * 3;
+                            heartColorArr[i3]     = baseHeartColors[i3]     * factor;
+                            heartColorArr[i3 + 1] = baseHeartColors[i3 + 1] * factor;
+                            heartColorArr[i3 + 2] = baseHeartColors[i3 + 2] * factor;
+                            outerColorArr[i3]     = baseOuterColors[i3]     * factor;
+                            outerColorArr[i3 + 1] = baseOuterColors[i3 + 1] * factor;
+                            outerColorArr[i3 + 2] = baseOuterColors[i3 + 2] * factor;
+                        }
+                        heartGeometry.attributes.color.needsUpdate = true;
+                        outerGlowGeo.attributes.color.needsUpdate = true;
+                    }
+                }
+
+                // --- Scatter/Assemble animation ---
+                if (Math.abs(animationProgress - animationTarget) > 0.0001) {
+                    const step = ANIMATION_SPEED * dt;
+                    if (animationTarget > animationProgress) {
+                        animationProgress = Math.min(animationTarget, animationProgress + step);
+                    } else {
+                        animationProgress = Math.max(animationTarget, animationProgress - step);
+                    }
+
+                    if (animationProgress > 0.99) {
+                        isAssembled = true;
+                        hintEl.textContent = '点击爱心散开';
+                        hintEl.classList.remove('scattered-hint');
+                        document.body.classList.remove('scattered');
+                    } else if (animationProgress < 0.01) {
+                        isAssembled = false;
+                        hintEl.textContent = '点击屏幕任意位置重组';
+                        hintEl.classList.add('scattered-hint');
+                        document.body.classList.add('scattered');
+                    } else {
+                        isAssembled = false;
+                    }
+
+                    const t = easeInOutCubic(animationProgress);
+                    const posArr = heartGeometry.attributes.position.array;
+                    const outerPosArr = outerGlowGeo.attributes.position.array;
+                    for (let i = 0; i < actualCount * 3; i++) {
+                        const val = heartPositions[i] * t + scatterPositions[i] * (1 - t);
+                        posArr[i] = val;
+                        outerPosArr[i] = val;
+                    }
+                    heartGeometry.attributes.position.needsUpdate = true;
+                    outerGlowGeo.attributes.position.needsUpdate = true;
+                }
+
+                // --- Subtle star rotation ---
+                stars.rotation.y += dt * 0.03;
+                stars.rotation.x += dt * 0.01;
+
+                // --- Render ---
+                renderer.render(scene, camera);
+            }
+
+            // ==================== START ====================
+            // Heart X-axis rotated 270°, particles twinkle like stars
+            heartGroup.rotation.set(Math.PI * 1.5, 0, 0);
+
+            requestAnimationFrame(animate);
+
+            console.log('%c💖 %c3D Particle Heart Ready %c💖',
+                'color:#ff4081;font-size:16px;', 'color:#fff;font-size:14px;', 'color:#ff4081;font-size:16px;');
+            console.log('%cParticles: ' + actualCount + ' | Star twinkle | Click heart to scatter | Click anywhere to reassemble',
+                'color:#aaa;');
+        })();
+    </script>
+</body>
+</html>
